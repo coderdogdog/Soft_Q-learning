@@ -24,8 +24,8 @@ def train():
     # 训练日志
     log_dir = f'''runs/{ENV_NAME}/TD3_{datetime.now().strftime("%Y%m%d_%H_%M_%S")}'''
     writer = SummaryWriter(log_dir)
+    print(f"在新的终端窗口运行TensorBoard: tensorboard --logdir=runs/{ENV_NAME}")
 
-    env = gym.make(ENV_NAME)
     # 创建训练环境 =================================
     env = gym.make(ENV_NAME, render_mode=None)
     # 创建用来测试评估的环境
@@ -46,7 +46,7 @@ def train():
     # 初始化 =================================
     state, _ = env.reset()
     total_steps = 0
-
+    print("开始训练！")
     while total_steps < max_env_steps:
         if total_steps < warmup_steps:
             action = env.action_space.sample()  # 预热期随机探索

@@ -100,7 +100,7 @@ class SoftQLearningAgent:
         soft_values = ALPHA * torch.logsumexp(q_values / ALPHA, dim=1, keepdim=True)
         return soft_values
 
-    def _compute_svgd_gradient(self, states, actions, q_values):
+    def _compute_svgd_gradient(self, actions, q_values):
         """
         这里不需要迭代多次，只需要算 “方向” ，迭代可以依靠外层的网络参数更新推进
         这就是: Soft Q-Learning 采用的摊销（Amortized SVGD） 技巧
@@ -109,58 +109,47 @@ class SoftQLearningAgent:
         Δf(s) = E_{a'~π}[ κ(a, a') ∇_{a'} Q(s, a') + α ∇_{a'} κ(a, a') ]
 
         参数:
-            states: [batch, state_dim]
-            actions: [batch, n_particles, action_dim]
-            q_values: [batch, n_particles]
+            actions: [batch , n_particles, action_dim]
+            q_values: [batch , n_particles, 1]
         """
-        batch_size, n_particles, action_dim = actions.shape
+        batch_size, n_particles, action_dim = BATCH_SIZE, N_PARTICLES, ACTION_DIM
 
-        # 展平以便计算
-        states_flat = states.unsqueeze(1).expand(-1, n_particles, -1).reshape(-1, STATE_DIM)    # 转为 形状 [b*n, STATE_DIM]
-        actions_flat = actions.reshape(-1, action_dim)      # 转为 形状 [b*n, ACTION_DIM]
-        q_flat = q_values.reshape(-1, 1)                    # 转为 形状 [b*n, 1]
+        # 打分函数
+        score = torch.autograd.grad(
+            outputs=q_values,  # [batch, N, 1]
+            inputs=actions,  # [batch, N, act_dim]
+            grad_outputs=torch.ones_like(q_values),
+            create_graph=False,  # 保留计算图，以便后续更新策略网络
+            retain_graph=False
+        )[0]  # 形状 [batch, N, act_dim]
 
         # 计算核函数 κ(a, a')（RBF核）
         # 这里 a 是当前粒子，a' 是所有粒子
-        actions_flat.requires_grad_(True)
+        # 计算粒子两两之间的距离：a_i - a_j
+        # actions.unsqueeze(2)  -> [batch, N, 1, act_dim] (即 a_i)
+        # actions.unsqueeze(1)  -> [batch, 1, N, act_dim] (即 a_j)
+        diff = actions.unsqueeze(2) - actions.unsqueeze(1)  # [batch, N, N, act_dim]
+        # 计算平方距离 (L2范数平方)
+        pairwise_sq_dist = torch.sum(diff ** 2, dim=-1)  # [batch, N, N]
 
-        # 计算所有粒子对的距离矩阵
-        # [n_total, 1, action_dim] - [1, n_total, action_dim]
-        diff = actions_flat.unsqueeze(1) - actions_flat.unsqueeze(0)    # [n_total, n_total, action_dim]
-        sq_dist = (diff ** 2).sum(dim=-1)       # [n_total, n_total]
-        """        
-        核带宽代码中常用0.5 
-        带宽太大：排斥力太弱，粒子容易模式坍塌（Mode Collapse），只覆盖一个峰值。
-        带宽太小：排斥力太强，粒子可能振荡不稳定，或无法有效探索。
-        """
-        bandwidth = 0.5  # 核带宽 
-        kernel = torch.exp(-sq_dist / (2 * bandwidth ** 2))  # [n_total, n_total]
+        with torch.no_grad():
+            # 去掉对角线上的 0 距离
+            mask = ~torch.eye(n_particles, dtype=torch.bool, device=actions.device)
+            dists = pairwise_sq_dist[:, mask].view(batch_size, -1)
+            # 取中位数，再开根号（因为 pairwise_sq_dist 是平方距离）
+            bandwidth = torch.sqrt(torch.median(dists, dim=1).values.mean()).item()
 
-        # 计算 ∇_{a'} Q(s, a')
-        q_flat_sum = q_flat.sum()
-        grad_q = torch.autograd.grad(
-            q_flat_sum, actions_flat, create_graph=False, retain_graph=False
-        )[0]  # [n_total, action_dim]
+        # 计算高斯核：K = exp( - ||a_i - a_j||^2 / (2 * h^2) )
+        kernel = torch.exp(-pairwise_sq_dist / (2 * (bandwidth ** 2)))  # [batch, N, N]
 
-        # 计算 ∇_{a'} κ(a, a')
-        # 对 a' 求梯度: d_kernel/da' = (a - a') / bandwidth^2 * kernel
-        grad_kernel = -(diff / (bandwidth ** 2)) * kernel.unsqueeze(-1)  # [n_total, n_total, action_dim]
+        term1 = torch.bmm(kernel, score)  # [batch, N, act_dim]
 
-        # 计算 SVGD 方向: (1/n) * Σ [ κ(a, a') ∇_{a'} Q + α ∇_{a'} κ ]
-        # 对每个粒子 i: Δf_i = (1/n) Σ_j [ κ(a_i, a_j) ∇_{a_j} Q + α ∇_{a_j} κ(a_i, a_j) ]
-        # 这里 α 是温度参数（与熵权重共享）
-        n_total = actions_flat.shape[0]
+        grad_k = (diff / (bandwidth ** 2)) * kernel.unsqueeze(-1)  # [batch, N, N, act_dim]
 
-        # 第一项: κ * ∇Q
-        term1 = (kernel.unsqueeze(-1) * grad_q.unsqueeze(0)).sum(dim=1) / n_total  # [n_total, action_dim]
+        # 对 j 维度求和：Σ_j ∇_{x_j} k(x_j, x_i)
+        term2 = ALPHA * torch.sum(grad_k, dim=2)  # [batch, N, act_dim]
 
-        # 第二项: α * ∇κ
-        term2 = ALPHA * grad_kernel.sum(dim=1) / n_total  # [n_total, action_dim]
-
-        delta_f = term1 + term2  # [n_total, action_dim]
-
-        # 恢复形状 [batch, n_particles, action_dim]
-        delta_f = delta_f.reshape(batch_size, n_particles, action_dim)
+        delta_f = (term1 + term2) / n_particles  # [batch, N, act_dim]
 
         return delta_f.detach()  # 停止梯度，作为回归目标
 
@@ -222,17 +211,17 @@ class SoftQLearningAgent:
         # 从当前策略采样动作粒子
         sampled_actions, _ = self.policy_net.sample(states, n_particles=N_PARTICLES)
         # [batch, n_particles, action_dim]
+        actions_detach = sampled_actions.detach().requires_grad_(True)
 
         # 计算每个粒子的 Q 值
-        states_expanded = states.unsqueeze(1).expand(-1, N_PARTICLES, -1).reshape(-1, STATE_DIM)
-        actions_flat = sampled_actions.reshape(-1, ACTION_DIM)
+        states_expanded = states.unsqueeze(1).expand(-1, N_PARTICLES, -1)
 
-        q1_particles = self.q_net1(states_expanded, actions_flat).reshape(BATCH_SIZE, N_PARTICLES)
-        q2_particles = self.q_net2(states_expanded, actions_flat).reshape(BATCH_SIZE, N_PARTICLES)
-        q_particles = torch.min(q1_particles, q2_particles)  # [batch, n_particles]
+        q1_particles = self.q_net1(states_expanded, sampled_actions)
+        q2_particles = self.q_net2(states_expanded, sampled_actions)
+        q_particles = torch.min(q1_particles, q2_particles)  # [batch, n_particles, 1]
 
         # 计算 SVGD 更新方向
-        delta_f = self._compute_svgd_gradient(states, sampled_actions, q_particles)
+        delta_f = self._compute_svgd_gradient(actions_detach, q_particles)
         # [batch, n_particles, action_dim]
 
         # 策略损失：让网络输出的动作向 delta_f 方向移动
@@ -240,20 +229,25 @@ class SoftQLearningAgent:
         policy_loss = -(
                 sampled_actions * delta_f
         ).sum(dim=-1).mean()
-
+        """
+        更稳定的方法，更标准的摊销 SVGD 做法
+        让策略更新更稳定。还能控制每一步移动的步长。
+        target_actions = sampled_actions.detach() + lr * delta_f
+        policy_loss = F.mse_loss(sampled_actions, target_actions)
+        """
         # 更新策略网络
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
         self.policy_optimizer.step()
 
-        # 软更新目标网络
         self.update_counter += 1
-        if self.update_counter % 2 == 0:  # 每2步更新一次目标网络
-            for target_param, param in zip(self.target_q_net1.parameters(), self.q_net1.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            for target_param, param in zip(self.target_q_net2.parameters(), self.q_net2.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        # 软更新目标网络
+        for target_param, param in zip(self.target_q_net1.parameters(), self.q_net1.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        for target_param, param in zip(self.target_q_net2.parameters(), self.q_net2.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
         # 控制记录频率
         if self.update_counter % 10 == 0:
