@@ -40,4 +40,5 @@ is_render_human = True
 
 avg_scores, avg_steps = evaluate_agent(test_env, sql_agent, is_render_human, test_num)
 test_env.close()
-
+print(f"======= 平均每局得分：{avg_scores:8.2f} ======= ")
+print(f"======= 平均每局步数：{avg_steps:8d} ======= ")

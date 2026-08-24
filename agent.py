@@ -5,7 +5,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from net import SoftQNetwork, PolicyNetwork
 from config import DEVICE, STATE_DIM, ACTION_DIM, HIDDEN_DIM, \
-    ALPHA, N_PARTICLES, BATCH_SIZE, GAMMA, LR_Q, LR_POLICY, TAU
+    ALPHA, N_PARTICLES, BATCH_SIZE, GAMMA, LR_Q, LR_POLICY, TAU, SVGD_LR
 
 
 class ReplayBuffer:
@@ -122,7 +122,7 @@ class SoftQLearningAgent:
             create_graph=False,  # 保留计算图，以便后续更新策略网络
             retain_graph=False
         )[0]  # 形状 [batch, N, act_dim]
-
+        score = score / ALPHA
         # 计算核函数 κ(a, a')（RBF核）
         # 这里 a 是当前粒子，a' 是所有粒子
         # 计算粒子两两之间的距离：a_i - a_j
@@ -147,7 +147,7 @@ class SoftQLearningAgent:
         grad_k = (diff / (bandwidth ** 2)) * kernel.unsqueeze(-1)  # [batch, N, N, act_dim]
 
         # 对 j 维度求和：Σ_j ∇_{x_j} k(x_j, x_i)
-        term2 = ALPHA * torch.sum(grad_k, dim=2)  # [batch, N, act_dim]
+        term2 = torch.sum(grad_k, dim=2)  # [batch, N, act_dim]
 
         delta_f = (term1 + term2) / n_particles  # [batch, N, act_dim]
 
@@ -207,34 +207,48 @@ class SoftQLearningAgent:
         torch.nn.utils.clip_grad_norm_(self.q_net2.parameters(), 0.5)
         self.q_optimizer.step()
 
-        # 使用 SVGD 更新策略网络
+        # 使用 SVGD 更新策略网络 ==================================================
         # 从当前策略采样动作粒子
         sampled_actions, _ = self.policy_net.sample(states, n_particles=N_PARTICLES)
         # [batch, n_particles, action_dim]
-        actions_detach = sampled_actions.detach().requires_grad_(True)
+        a_svgd = sampled_actions.detach().requires_grad_(True)
 
         # 计算每个粒子的 Q 值
         states_expanded = states.unsqueeze(1).expand(-1, N_PARTICLES, -1)
 
-        q1_particles = self.q_net1(states_expanded, sampled_actions)
-        q2_particles = self.q_net2(states_expanded, sampled_actions)
+        q1_particles = self.q_net1(states_expanded, a_svgd)
+        q2_particles = self.q_net2(states_expanded, a_svgd)
         q_particles = torch.min(q1_particles, q2_particles)  # [batch, n_particles, 1]
 
         # 计算 SVGD 更新方向
-        delta_f = self._compute_svgd_gradient(actions_detach, q_particles)
+        delta_f = self._compute_svgd_gradient(a_svgd, q_particles)
         # [batch, n_particles, action_dim]
 
         # 策略损失：让网络输出的动作向 delta_f 方向移动
         # 等价于最小化 - E[ a^T * delta_f ]
-        policy_loss = -(
-                sampled_actions * delta_f
-        ).sum(dim=-1).mean()
+        # policy_loss = -(
+        #         sampled_actions * delta_f
+        # ).sum(dim=-1).mean()
         """
         更稳定的方法，更标准的摊销 SVGD 做法
         让策略更新更稳定。还能控制每一步移动的步长。
-        target_actions = sampled_actions.detach() + lr * delta_f
-        policy_loss = F.mse_loss(sampled_actions, target_actions)
         """
+        # 设置一个更新步长，控制每次移动的距离
+        svgd_lr = SVGD_LR  # 可以根据情况调整为 0.1, 0.5 等
+
+        # 构造回归目标：在当前动作的基础上，沿着 SVGD 方向走一小步
+        target_actions = sampled_actions.detach() + svgd_lr * delta_f
+        # 关键：将目标动作限制在合法的动作空间范围内
+        # 假设动作最大值是 max_action (通常是 1.0)  Bipedal Walker
+        max_action = 1.0        # Bipedal Walker
+        target_actions = torch.clamp(target_actions, -max_action, max_action)
+
+        # 使用 MSE 损失，把网络输出拉向目标
+        # policy_loss = F.mse_loss(sampled_actions, target_actions)
+
+        # 注意：这里的 beta 参数控制了“二次损失”和“线性损失”的阈值
+        policy_loss = F.smooth_l1_loss(sampled_actions, target_actions, beta=0.2)
+
         # 更新策略网络
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
@@ -251,9 +265,18 @@ class SoftQLearningAgent:
 
         # 控制记录频率
         if self.update_counter % 10 == 0:
+            # 观察指标
+            q_mean = torch.min(current_q1, current_q2).detach().mean().item()
+            # target_q 已算出，q_loss 已算出：
+            q_scale = target_q.detach().abs().mean() + 1e-8  # 防止除 0
+            normalized_q_loss = q_loss.item() / q_scale.item()
+
             # TensorBoard 记录
             writer.add_scalar("train/q_loss", q_loss.item(), self.update_counter)
+            writer.add_scalar("train/q_mean", q_mean, self.update_counter)
+            writer.add_scalar("train/normalized_q_loss", normalized_q_loss, self.update_counter)
             writer.add_scalar("train/policy_loss", policy_loss.item(), self.update_counter)
+            writer.add_scalar("train/delta_f", delta_f.mean().item(), self.update_counter)
 
     def save(self, path_policy_net):
         """保存策略网络权重"""

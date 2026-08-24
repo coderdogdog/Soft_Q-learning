@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import os
 import gymnasium as gym
 from pathlib import Path
 from datetime import datetime
@@ -46,6 +47,8 @@ def train():
     # 初始化 =================================
     state, _ = env.reset()
     total_steps = 0
+    best_reward = -float(1000)
+    best_path = model_dir + "best_" + str(int(best_reward)) + ".pth"
     print("开始训练！")
     while total_steps < max_env_steps:
         if total_steps < warmup_steps:
@@ -76,6 +79,13 @@ def train():
 
                 writer.add_scalar("test/avg_r", avg_r, sql_agent.update_counter)
                 writer.add_scalar("test/avg_steps", avg_steps, sql_agent.update_counter)
+
+                if avg_r > best_reward:
+                    if os.path.isfile(best_path):
+                        os.remove(best_path)
+                    best_reward = avg_r
+                    best_path = model_dir + "best_" + str(int(best_reward)) + ".pth"
+                    sql_agent.save(best_path)
 
             # 保存策略网络
             if sql_agent.update_counter % 5000 == 0:
